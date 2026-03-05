@@ -740,7 +740,7 @@ app.put(
 );
 
 // menghapus pengajuan reimbursement
-app.delete("/api/reimbursements/:id", verifyToken, async (req, res) => {
+app.delete("/api/delete-reimbursements/:id", verifyToken, async (req, res) => {
   const { id } = req.params;
 
   const conn = await pool.getConnection();
