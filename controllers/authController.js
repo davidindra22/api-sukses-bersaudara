@@ -28,8 +28,6 @@ export const loginUser = async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: "1h" },
     );
-    console.log("SIGN SECRET:", process.env.JWT_SECRET);
-
     return res.status(200).json({
       message: "Login berhasil",
       token,

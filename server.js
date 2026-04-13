@@ -596,7 +596,7 @@ app.delete("/api/detele-foto-client/:id", async (req, res) => {
 app.post(
   "/api/reimbursements",
   verifyToken,
-  uploadReimburse.array("proof_file"),
+  uploadReimburse.any(),
   async (req, res) => {
     const conn = await pool.getConnection();
 
@@ -604,20 +604,36 @@ app.post(
       const docNumber = await generateDocNumber();
       const user = req.user;
 
-      const { aktivitas, tgl_mulai, tgl_selesai, jumlah } = req.body;
-
-      console.log(
-        "FILES:",
-        req.files.map((f) => f.filename),
-      );
+      const { aktivitas, tgl_mulai, tgl_selesai } = req.body;
 
       await conn.beginTransaction();
 
+      // parsing bukti
+      const bukti = req.body.bukti || [];
+
+      // mapping file
+      req.files.forEach((file) => {
+        const match = file.fieldname.match(/\[(\d+)\]/);
+
+        if (match) {
+          const index = match[1];
+          if (bukti[index]) {
+            bukti[index].proof_file = file.filename;
+          }
+        }
+      });
+
+      // hitung total
+      const total = bukti.reduce((acc, item) => {
+        return acc + Number(item.jumlah || 0);
+      }, 0);
+
+      // insert reimbursement
       const [result] = await conn.query(
         `INSERT INTO reimbursements 
-   (document_number, employee_id, employee_name,
-    activity_name, start_date, end_date, amount)
-   VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        (document_number, employee_id, employee_name,
+        activity_name, start_date, end_date, amount)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [
           docNumber,
           user.id,
@@ -625,23 +641,25 @@ app.post(
           aktivitas,
           tgl_mulai,
           tgl_selesai,
-          jumlah,
+          total,
         ],
       );
 
       const reimbursementId = result.insertId;
 
-      // insert files
-      if (req.files?.length) {
-        const fileValues = req.files.map((file) => [
-          reimbursementId,
-          file.filename,
-        ]);
-
+      // insert detail
+      for (const item of bukti) {
         await conn.query(
-          `INSERT INTO reimbursement_files (id_reimbursement, namefile)
-     VALUES ?`,
-          [fileValues],
+          `INSERT INTO reimbursement_files
+          (id_reimbursement	, jumlah, keterangan, tanggal, namefile)
+          VALUES (?, ?, ?, ?, ?)`,
+          [
+            reimbursementId,
+            item.jumlah,
+            item.keterangan,
+            item.tanggal,
+            item.proof_file || null,
+          ],
         );
       }
 
@@ -655,7 +673,9 @@ app.post(
     } catch (err) {
       await conn.rollback();
       conn.release();
+
       console.error(err);
+
       res.status(500).json({
         error: err.message,
         message: "Gagal menambahkan pengajuan reimburse",
@@ -668,11 +688,43 @@ app.post(
 app.put(
   "/api/edit-reimbursements/:id",
   verifyToken,
-  uploadReimburse.array("proof_file"),
+  uploadReimburse.any(),
   async (req, res) => {
     const { id } = req.params;
-    const { activity_name, start_date, end_date, amount } = req.body;
-    const deletedFiles = JSON.parse(req.body.deletedFiles || "[]");
+    const { activity_name, start_date, end_date } = req.body;
+
+    let bukti = [];
+
+    try {
+      bukti = JSON.parse(req.body.bukti || "[]");
+    } catch {
+      bukti = [];
+    }
+
+    let deletedFiles = [];
+    try {
+      deletedFiles = JSON.parse(req.body.deletedFiles || "[]");
+    } catch {
+      deletedFiles = [];
+    }
+
+    // 🔥 mapping file
+    const buktiMap = {};
+
+    bukti.forEach((item, index) => {
+      buktiMap[index] = { ...item };
+    });
+
+    req.files.forEach((file) => {
+      const match = file.fieldname.match(/bukti\[(\d+)\]\[proof_file\]/);
+
+      if (match) {
+        const index = match[1];
+        buktiMap[index].proof_file = file.filename;
+      }
+    });
+
+    const finalBukti = Object.values(buktiMap);
 
     const conn = await pool.getConnection();
 
@@ -683,42 +735,67 @@ app.put(
         "SELECT status FROM reimbursements WHERE id = ?",
         [id],
       );
-      const currentStatus = rows[0]?.status;
+
+      if (rows.length === 0) {
+        await conn.rollback();
+        conn.release();
+        return res.status(404).json({ message: "Data tidak ditemukan" });
+      }
+
+      const currentStatus = rows[0].status;
 
       if (currentStatus === "Approved") {
+        await conn.rollback();
+        conn.release();
         return res.status(400).json({
           message: "Reimbursement sudah di-approve dan tidak bisa diubah",
         });
       }
 
+      // hitung total
+      const total = finalBukti.reduce((acc, item) => {
+        return acc + Number(item.jumlah || 0);
+      }, 0);
+
       await conn.query(
-        "UPDATE reimbursements SET activity_name = ?, start_date = ?, end_date = ?, amount = ?, status = 'pending', reject_reason = NULL WHERE id = ?",
-        [activity_name, start_date, end_date, amount, id],
+        `UPDATE reimbursements 
+         SET activity_name = ?, start_date = ?, end_date = ?, amount = ?, 
+         status = 'pending', reject_reason = NULL 
+         WHERE id = ?`,
+        [activity_name, start_date, end_date, total, id],
       );
 
-      // hapus file lama
-      for (let fileName of deletedFiles) {
-        await conn.query(
-          "DELETE FROM reimbursement_files WHERE id_reimbursement = ? AND namefile = ?",
-          [id, fileName],
-        );
-        const filePath = path.join(
-          __dirname,
-          "uploads/reimbursements",
-          fileName,
-        );
+      // update/insert bukti baru
+      for (const item of finalBukti) {
+        const fileName = item.proof_file || item.namefile;
 
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-        }
-      }
+        // kalau data lama (punya id)
+        if (item.id) {
+          if (item.proof_file && item.namefile) {
+            const oldPath = path.join(
+              __dirname,
+              "uploads/reimbursements",
+              item.namefile,
+            );
 
-      // tambah foto baru
-      if (req.files && req.files.length > 0) {
-        for (let file of req.files) {
+            if (fs.existsSync(oldPath)) {
+              await fs.promises.unlink(oldPath);
+            }
+          }
           await conn.query(
-            "INSERT INTO reimbursement_files (id_reimbursement, namefile) VALUES (?, ?)",
-            [id, file.filename],
+            `UPDATE reimbursement_files
+           SET jumlah = ?, keterangan = ?, tanggal = ?, namefile = ?
+           WHERE id = ? AND id_reimbursement = ?`,
+            [item.jumlah, item.keterangan, item.tanggal, fileName, item.id, id],
+          );
+        }
+        // kalau data baru
+        else {
+          await conn.query(
+            `INSERT INTO reimbursement_files
+           (id_reimbursement, jumlah, keterangan, tanggal, namefile)
+           VALUES (?, ?, ?, ?, ?)`,
+            [id, item.jumlah, item.keterangan, item.tanggal, fileName],
           );
         }
       }
@@ -726,13 +803,15 @@ app.put(
       await conn.commit();
       conn.release();
 
-      res
-        .status(200)
-        .json({ message: "Pengajuan reimburse berhasil diperbarui" });
+      res.status(200).json({
+        message: "Pengajuan reimburse berhasil diperbarui",
+      });
     } catch (err) {
       await conn.rollback();
       conn.release();
+
       console.error(err);
+
       res.status(500).json({
         error: err.message,
         message: "Gagal mengedit pengajuan reimburse",
@@ -799,7 +878,7 @@ app.get("/api/reimbursements/my", verifyToken, async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT 
-        r.id,
+        r.id AS reimbursement_id,
         r.document_number,
         r.activity_name,
         r.start_date,
@@ -808,21 +887,26 @@ app.get("/api/reimbursements/my", verifyToken, async (req, res) => {
         r.status,
         r.reject_reason,
         r.created_at,
+        f.id AS id_bukti,
+        f.jumlah,
+        f.keterangan,
+        f.tanggal,
         f.namefile
       FROM reimbursements r
       LEFT JOIN reimbursement_files f
         ON r.id = f.id_reimbursement
       WHERE r.employee_id = ?
-      ORDER BY r.created_at DESC`,
+      ORDER BY f.tanggal ASC`,
       [userId],
     );
 
     // GROUP DATA
     const map = {};
+
     rows.forEach((row) => {
-      if (!map[row.id]) {
-        map[row.id] = {
-          id: row.id,
+      if (!map[row.reimbursement_id]) {
+        map[row.reimbursement_id] = {
+          id: row.reimbursement_id,
           document_number: row.document_number,
           activity_name: row.activity_name,
           start_date: row.start_date,
@@ -831,11 +915,18 @@ app.get("/api/reimbursements/my", verifyToken, async (req, res) => {
           status: row.status,
           reject_reason: row.reject_reason,
           created_at: row.created_at,
-          files: [],
+          bukti: [],
         };
       }
-      if (row.namefile) {
-        map[row.id].files.push(row.namefile);
+
+      if (row.jumlah !== null) {
+        map[row.reimbursement_id].bukti.push({
+          id: row.id_bukti,
+          jumlah: row.jumlah,
+          keterangan: row.keterangan,
+          tanggal: row.tanggal,
+          namefile: row.namefile,
+        });
       }
     });
 
@@ -850,25 +941,36 @@ app.get("/api/reimbursements/my", verifyToken, async (req, res) => {
 app.get("/api/admin/reimbursements", verifyToken, isAdmin, async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT 
-        r.id,
-        r.employee_name,
-        r.activity_name,
-        r.start_date,
-        r.end_date,
-        r.amount,
-        r.status,
-        r.reject_reason,
-        r.created_at,
-        COALESCE(
-          JSON_ARRAYAGG(f.namefile),
-          JSON_ARRAY()
-        ) AS files
-      FROM reimbursements r
-      LEFT JOIN reimbursement_files f
-        ON r.id = f.id_reimbursement
-      GROUP BY r.id
-      ORDER BY r.created_at DESC
+     SELECT 
+  r.id,
+  r.document_number,
+  r.employee_name,
+  r.activity_name,
+  r.start_date,
+  r.end_date,
+  r.amount,
+  r.status,
+  r.reject_reason,
+  r.created_at,
+
+  COALESCE(
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'keterangan', f.keterangan,
+        'jumlah', f.jumlah,
+        'tanggal', f.tanggal,
+        'file', f.namefile
+      )
+    ),
+    JSON_ARRAY()
+  ) AS bukti
+
+FROM reimbursements r
+LEFT JOIN reimbursement_files f
+  ON r.id = f.id_reimbursement
+
+GROUP BY r.id
+ORDER BY r.created_at DESC;
     `);
 
     res.json(rows);
